@@ -15,7 +15,7 @@ of the season: 2010 means 2009-10.
 
 ### Get the data
 
-The finished CSVs are in [`6404_nba_data_processing/datasets/`](6404_nba_data_processing/datasets/).
+The finished CSVs are in [`data collection/datasets/`](data%20collection/datasets/).
 
 To generate the CSVs yourself, open R or RStudio with this project folder as your
 working directory:
@@ -29,8 +29,8 @@ working directory:
 2. Run the preprocessing script:
 
    ```r
-   source("6404_nba_data_processing/load_base_data_final.R", encoding = "UTF-8")
+   source("data collection/load_base_data_final.R", encoding = "UTF-8")
    ```
 
-The script saves all four CSVs in `6404_nba_data_processing/datasets/`. The first
+The script saves all four CSVs in `data collection/datasets/`. The first
 run needs internet access; later runs reuse the downloaded source cache.

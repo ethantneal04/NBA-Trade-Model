@@ -4,4 +4,4 @@
 .gitattributes text eol=lf
 # Preserve the exact bytes of the validated dataset exports.
 *.csv -text
-6404_nba_data_processing/datasets/nba_player_games_2010_2026.csv filter=lfs diff=lfs merge=lfs -text
+"data collection/datasets/nba_player_games_2010_2026.csv" filter=lfs diff=lfs merge=lfs -text

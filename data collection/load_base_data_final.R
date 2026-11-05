@@ -22,7 +22,7 @@ if (length(source_files)) {
 } else {
   SCRIPT_DIR <- getwd()
   if (!file.exists(file.path(SCRIPT_DIR, 'load_base_data_final.R'))) {
-    candidate <- file.path(SCRIPT_DIR, '6404_nba_data_processing')
+    candidate <- file.path(SCRIPT_DIR, 'data collection')
     if (!file.exists(file.path(candidate, 'load_base_data_final.R')))
       stop('Source this file, use Rscript, or set the working directory to its folder.')
     SCRIPT_DIR <- candidate
