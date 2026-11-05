@@ -1,0 +1,18 @@
+# Downloaded inputs stay local; the finished CSV datasets are tracked.
+/.nba_preprocessing_cache/
+
+# R session and editor files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+.vscode/
+.idea/
+
+# Local credentials and operating-system files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini
