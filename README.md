@@ -16,8 +16,6 @@ of the season: 2010 means 2009-10.
 ### Get the data
 
 The finished CSVs are in [`6404_nba_data_processing/datasets/`](6404_nba_data_processing/datasets/).
-If you cloned the repository, run `git lfs pull` with Git LFS installed to download
-the large player-games CSV.
 
 To generate the CSVs yourself, open R or RStudio with this project folder as your
 working directory:
