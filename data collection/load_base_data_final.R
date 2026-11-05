@@ -1,9 +1,10 @@
 # NBA data preparation, seasons ending 2010 through 2026.
 # The year refers to the end of a season: 2010 means the 2009-10 season.
 # Run with Rscript load_base_data_final.R, or source this file in RStudio.
-# Install hoopR, dplyr and tibble before the first run.
+# Install hoopR, dplyr, tibble and jsonlite before the first run.
 #
-# The four finished tables are written as CSVs in datasets beside this script.
+# The five finished tables are written as CSVs in datasets beside this script.
+# Trade records use NBA_Player_Movement.json beside this script (coverage starts in 2015).
 # Downloads are kept in ../.nba_preprocessing_cache/sources so later runs can
 # use the same inputs without downloading them again. Intermediate tables stay
 # in memory. A fresh download can change results if a source has been updated.
@@ -30,6 +31,14 @@ if (length(source_files)) {
 }
 OUTPUT_ROOT <- file.path(SCRIPT_DIR, 'datasets')
 CACHE_ROOT <- file.path(dirname(SCRIPT_DIR), '.nba_preprocessing_cache', 'sources')
+TRADE_JSON_PATH <- file.path(SCRIPT_DIR, 'NBA_Player_Movement.json')
+TRADE_START_DATE <- as.Date('2015-07-01')
+TRADE_END_DATE <- Sys.Date()
+if (!requireNamespace('jsonlite', quietly=TRUE))
+  stop("Install jsonlite first: install.packages('jsonlite')")
+if (!file.exists(TRADE_JSON_PATH))
+  stop('Place NBA_Player_Movement.json beside this R script before running it.')
+
 
 # 1. Load and clean the game data
 #
@@ -688,12 +697,211 @@ GAME_ENRICHED <- PG %>% left_join(P %>% select(player_id,season,age,height_inche
  by=c('player_id','season'),relationship='many-to-one') %>%
  left_join(PR,by=c('player_id','season'='prior_season'),relationship='many-to-one') %>%
  left_join(IM_PRIOR,by=c('player_id','season'),relationship='many-to-one')
-# 4. Assemble the four final tables
+# 4. Read the official trade records
+#
+# Use the supplied JSON snapshot rather than trying to infer trades from game
+# appearances. Team directions are accepted only when supported by the text;
+# unresolved rows keep their source fields and a review status. Draft-pick and
+# other asset rows without player IDs are retained, matching the original feed.
+build_nba_trade_dataset <- function(json_path, start_date, end_date) {
+  NBA_JSON_URL <- "https://stats.nba.com/js/data/playermovement/NBA_Player_Movement.json"
+  # Known NBA team identifiers; old aliases map to the same franchise ID.
+  team_lookup <- c(
+    "Atlanta Hawks" = 1610612737, "Boston Celtics" = 1610612738,
+    "Brooklyn Nets" = 1610612751, "New Jersey Nets" = 1610612751,
+    "Charlotte Hornets" = 1610612766, "Charlotte Bobcats" = 1610612766,
+    "Chicago Bulls" = 1610612741, "Cleveland Cavaliers" = 1610612739,
+    "Dallas Mavericks" = 1610612742, "Denver Nuggets" = 1610612743,
+    "Detroit Pistons" = 1610612765, "Golden State Warriors" = 1610612744,
+    "Houston Rockets" = 1610612745, "Indiana Pacers" = 1610612754,
+    "LA Clippers" = 1610612746, "Los Angeles Clippers" = 1610612746,
+    "Los Angeles Lakers" = 1610612747, "Memphis Grizzlies" = 1610612763,
+    "Miami Heat" = 1610612748, "Milwaukee Bucks" = 1610612749,
+    "Minnesota Timberwolves" = 1610612750,
+    "New Orleans Pelicans" = 1610612740, "New Orleans Hornets" = 1610612740,
+    "New York Knicks" = 1610612752, "Oklahoma City Thunder" = 1610612760,
+    "Orlando Magic" = 1610612753, "Philadelphia 76ers" = 1610612755,
+    "Phoenix Suns" = 1610612756, "Portland Trail Blazers" = 1610612757,
+    "Sacramento Kings" = 1610612758, "San Antonio Spurs" = 1610612759,
+    "Toronto Raptors" = 1610612761, "Utah Jazz" = 1610612762,
+    "Washington Wizards" = 1610612764
+  )
+  team_names <- names(team_lookup)[order(nchar(names(team_lookup)), decreasing = TRUE)]
+  team_abbr <- c(
+    "1610612737"="ATL", "1610612738"="BOS", "1610612751"="BKN",
+    "1610612766"="CHA", "1610612741"="CHI", "1610612739"="CLE",
+    "1610612742"="DAL", "1610612743"="DEN", "1610612765"="DET",
+    "1610612744"="GSW", "1610612745"="HOU", "1610612754"="IND",
+    "1610612746"="LAC", "1610612747"="LAL", "1610612763"="MEM",
+    "1610612748"="MIA", "1610612749"="MIL", "1610612750"="MIN",
+    "1610612740"="NOP", "1610612752"="NYK", "1610612760"="OKC",
+    "1610612753"="ORL", "1610612755"="PHI", "1610612756"="PHX",
+    "1610612757"="POR", "1610612758"="SAC", "1610612759"="SAS",
+    "1610612761"="TOR", "1610612762"="UTA", "1610612764"="WAS"
+  )
+
+  # Identify a complete team name at the START of a phrase.
+  team_id_at_start <- function(x) {
+    x <- trimws(sub("^the\\s+", "", x, ignore.case = TRUE))
+    if (is.na(x) || !nzchar(x)) return(NA_character_)
+    for (name in team_names) {
+      if (grepl(paste0("^", name, "(?=$|[^[:alpha:]])"), x,
+                ignore.case = TRUE, perl = TRUE)) {
+        return(as.character(as.integer(team_lookup[[name]])))
+      }
+    }
+    NA_character_
+  }
+
+  # These descriptions explicitly establish team direction.
+  # For other wording, leave direction unconfirmed rather than guessing.
+  parse_teams <- function(description) {
+    if (is.na(description) || !nzchar(trimws(description))) {
+      return(c(from = NA_character_, to = NA_character_))
+    }
+    s <- trimws(description)
+    action <- regexpr("\\s+(received|acquired|obtained|traded|sent|dealt)\\s+",
+                      s, ignore.case = TRUE, perl = TRUE)
+    if (action[1] < 1L) return(c(from = NA_character_, to = NA_character_))
+    actor <- team_id_at_start(substr(s, 1L, action[1] - 1L))
+    verb <- tolower(trimws(substr(s, action[1] + 1L,
+                                   action[1] + attr(action, "match.length") - 2L)))
+    if (is.na(actor)) return(c(from = NA_character_, to = NA_character_))
+    preposition <- if (verb %in% c("received", "acquired", "obtained")) "from" else "to"
+    matches <- gregexpr(paste0("\\b", preposition, "\\b"), s,
+                        ignore.case = TRUE, perl = TRUE)[[1]]
+    if (matches[1] < 1L) return(c(from = NA_character_, to = NA_character_))
+    # Prefer last occurrence, which normally precedes the other team's name.
+    pos <- tail(matches, 1L)
+    other <- team_id_at_start(substr(s, pos + nchar(preposition), nchar(s)))
+    if (is.na(other) || identical(actor, other)) {
+      return(c(from = NA_character_, to = NA_character_))
+    }
+    if (preposition == "from") c(from = other, to = actor)
+    else c(from = actor, to = other)
+  }
+
+  char_column <- function(df, key) {
+    if (!key %in% names(df)) stop("Missing required source field: ", key)
+    x <- as.character(df[[key]])
+    x[is.na(x) | trimws(x) %in% c("", "NA", "NULL", "null")] <- NA_character_
+    x
+  }
+  id_column <- function(df, key) {
+    values <- suppressWarnings(as.numeric(char_column(df, key)))
+    out <- rep(NA_character_, length(values))
+    ok <- is.finite(values) & values > 0 & values == floor(values)
+    out[ok] <- format(values[ok], scientific = FALSE, trim = TRUE)
+    out
+  }
+
+  message("Reading official NBA transaction JSON...")
+  payload <- tryCatch(
+    jsonlite::fromJSON(json_path),
+    error = function(e) stop("Could not read ", json_path, ": ", conditionMessage(e), call. = FALSE)
+  )
+  rows <- payload$NBA_Player_Movement$rows
+  if (is.null(rows)) stop("Expected NBA_Player_Movement$rows in the downloaded JSON")
+  if (!is.data.frame(rows)) {
+    rows <- as.data.frame(rows, stringsAsFactors = FALSE)
+  }
+  needed <- c("Transaction_Type", "TRANSACTION_DATE", "TRANSACTION_DESCRIPTION",
+              "TEAM_ID", "PLAYER_ID", "PLAYER_SLUG", "Additional_Sort", "GroupSort")
+  missing <- setdiff(needed, names(rows))
+  if (length(missing)) stop("Unexpected JSON structure; missing: ", paste(missing, collapse = ", "))
+
+  rows <- rows[tolower(trimws(char_column(rows, "Transaction_Type"))) == "trade", , drop = FALSE]
+  if (!nrow(rows)) stop("No 'Trade' rows found in this NBA JSON")
+  trade_date <- as.Date(substr(char_column(rows, "TRANSACTION_DATE"), 1L, 10L))
+  keep <- !is.na(trade_date) & trade_date >= start_date & trade_date <= end_date
+  rows <- rows[keep, , drop = FALSE]
+  trade_date <- trade_date[keep]
+  if (!nrow(rows)) stop("No trades within chosen date range")
+
+  player_id <- id_column(rows, "PLAYER_ID")
+  player_slug <- char_column(rows, "PLAYER_SLUG")
+  description <- char_column(rows, "TRANSACTION_DESCRIPTION")
+  raw_team_id <- id_column(rows, "TEAM_ID")
+  raw_other_id <- id_column(rows, "Additional_Sort")
+
+  parsed <- t(vapply(description, parse_teams, c(from = NA_character_, to = NA_character_)))
+  from_id <- rep(NA_character_, nrow(rows))
+  to_id <- rep(NA_character_, nrow(rows))
+  status <- rep("needs_review", nrow(rows))
+
+  for (i in seq_len(nrow(rows))) {
+    a <- parsed[i, "from"]
+    b <- parsed[i, "to"]
+    if (is.na(a) || is.na(b)) next
+    if (!is.na(raw_team_id[i]) && raw_team_id[i] != b) {
+      status[i] <- "team_id_conflict"
+      next
+    }
+    if (!is.na(raw_other_id[i]) && raw_other_id[i] != a) {
+      # Additional_Sort is a sorting field, not guaranteed to be the origin team.
+      # Keep the direction supported by text, but label the disagreement.
+      status[i] <- "description_verified_other_id_differs"
+    } else {
+      status[i] <- "description_and_ids_agree"
+    }
+    from_id[i] <- a
+    to_id[i] <- b
+  }
+
+  abbr <- function(ids) unname(team_abbr[ids])
+  name_from_slug <- function(slug) {
+    out <- rep(NA_character_, length(slug))
+    ok <- !is.na(slug) & nzchar(slug)
+    out[ok] <- tools::toTitleCase(gsub("-", " ", slug[ok]))
+    out
+  }
+
+  out <- data.frame(
+    trade_date = trade_date,
+    nba_player_id = player_id,
+    player_slug = player_slug,
+    player_name = name_from_slug(player_slug), # convenient label; slug may not preserve capitalization
+    from_team = abbr(from_id),
+    to_team = abbr(to_id),
+    from_team_id = from_id,
+    to_team_id = to_id,
+    team_match_status = status,
+    source_team_id = raw_team_id,
+    source_additional_sort = raw_other_id,
+    trade_group = char_column(rows, "GroupSort"),
+    description = description,
+    source_url = NBA_JSON_URL,
+    stringsAsFactors = FALSE
+  )
+
+  if (any(grepl("^\\d{4}-\\d{2}-\\d{2}", out$player_slug) & !is.na(out$player_slug))) {
+    stop("Unexpected date values in player slugs. No file written.")
+  }
+  if (any(!is.na(out$from_team) & !is.na(out$to_team) &
+          out$from_team == out$to_team)) {
+    stop("Origin and destination coincide. No file written.")
+  }
+  if (any(is.na(out$nba_player_id) | is.na(out$player_slug))) {
+    warning("Source trade rows without player identifiers are retained, including non-player assets.")
+  }
+  out <- unique(out)
+  out <- out[order(out$trade_date, out$player_slug), , drop = FALSE]
+  row.names(out) <- NULL
+  out
+}
+
+TRADES_FINAL <- build_nba_trade_dataset(TRADE_JSON_PATH, TRADE_START_DATE, TRADE_END_DATE)
+message('Trade source rows: ', nrow(TRADES_FINAL),
+        '; player IDs present: ', sum(!is.na(TRADES_FINAL$nba_player_id)),
+        '; team directions verified: ', sum(!is.na(TRADES_FINAL$from_team_id)))
+
+# 5. Assemble the five final tables
 #
 # Player games contain box scores, player lookbacks, bios and prior-season metrics.
 # Team games contain team box scores and team lookbacks. Stints describe consecutive
 # spells with a team. Player-team-seasons combine repeated spells so BRef's
 # team-season statistics can be represented at the level they actually describe.
+# The trade table contains dated source records and their player/team identifiers.
 FINAL <- OUTPUT_ROOT
 dir.create(FINAL, recursive=TRUE, showWarnings=FALSE)
 
@@ -730,15 +938,16 @@ stopifnot(nrow(PLAYER_GAMES_FINAL)==nrow(player),
           !anyDuplicated(PLAYER_STINTS_FINAL[c('player_id','season','team_id','stint_index')]),
           !anyDuplicated(PLAYER_TEAM_SEASONS_FINAL[c('player_id','season','team_id')]))
 
-# 5. Write the finished CSVs
+# 6. Write the finished CSVs
 #
 # Blank CSV cells represent missing values. Keep row names out of the files so
-# each column corresponds to a dataset field. Only these four tables are exported.
+# each column corresponds to a dataset field. Only these five tables are exported.
 exports <- list(
   nba_player_games_2010_2026 = PLAYER_GAMES_FINAL,
   nba_team_games_2010_2026 = TEAM_GAMES_FINAL,
   nba_player_stints_2010_2026 = PLAYER_STINTS_FINAL,
-  nba_player_team_seasons_2010_2026 = PLAYER_TEAM_SEASONS_FINAL
+  nba_player_team_seasons_2010_2026 = PLAYER_TEAM_SEASONS_FINAL,
+  nba_traded_players = TRADES_FINAL
 )
 for (nm in names(exports)) {
   write.csv(exports[[nm]], file.path(FINAL, paste0(nm,'.csv')),
@@ -746,4 +955,4 @@ for (nm in names(exports)) {
   cat('SAVED ', nm, ': ', nrow(exports[[nm]]), ' rows; ',
       ncol(exports[[nm]]), ' columns\n', sep='')
 }
-cat('FOUR-TABLE PIPELINE COMPLETE: ', normalizePath(FINAL), '\n')
+cat('FIVE-TABLE PIPELINE COMPLETE: ', normalizePath(FINAL), '\n')
