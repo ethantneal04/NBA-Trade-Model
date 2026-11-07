@@ -48,7 +48,7 @@ predict_translation_ridge <- function(model, data, lambda=model$lambda) {
 
 translation_clip <- function(x, target) {
   # TS can exceed 100%; 150% is the box-score maximum for made threes.
-  upper <- c(minutes=48, usg=100, ts=150, ast=100)[[target]]
+  upper <- c(minutes=Inf, usg=100, ts=150, ast=100)[[target]]
   pmin(pmax(x, 0), upper)
 }
 
@@ -99,7 +99,7 @@ fit_player_translation <- function(bundle) {
   validation <- which(data$cutoff >= config$validation_start & data$target_end < config$test_start)
   test <- which(data$cutoff >= config$test_start)
   development <- which(data$target_end < config$test_start)
-  if (length(train)<100 || sum(data$transfer[validation])<10 || sum(data$transfer[test])<10)
+  if (length(train)<100 || sum(data$verified_trade[validation])<10 || sum(data$verified_trade[test])<10)
     stop('Insufficient observations for the chronological splits.')
   stopifnot(max(data$target_end[train]) < min(data$cutoff[validation]),
             max(data$target_end[development]) < min(data$cutoff[test]),
@@ -116,7 +116,7 @@ fit_player_translation <- function(bundle) {
     lambda_a[[target]] <- config$lambda_grid[selected]
     validation_a[,target] <- predictions[,selected]
     tuning[[length(tuning)+1L]] <- data.frame(stage='A', target=target,
-      lambda=lambda_a[[target]], trade_weight=1, scale=1, validation_mae=errors[selected])
+      lambda=lambda_a[[target]], trade_weight=1, scale=1, validation_mae=errors[selected],cohort='all_periods')
   }
   message('Building chronological baseline residuals for team-change models')
   crossfit <- translation_crossfit(data, config, features$baseline)
@@ -125,11 +125,15 @@ fit_player_translation <- function(bundle) {
   all_residual_rows <- which(data$transfer & data$target_end < config$test_start &
                               apply(is.finite(crossfit$predictions),1L,all))
   if (length(residual_rows)<40L) stop('Insufficient out-of-time transfer residuals.')
-  held_moves <- which(data$transfer[validation])
+  held_moves <- which(data$verified_trade[validation])
   validation_move_rows <- validation[held_moves]
-  models_b <- list(); models_no_destination <- list()
-  for (variant in c('adjustment','no_destination')) {
+  models_b <- list(); models_no_destination <- list(); models_raw <- list()
+  validation_predictions <- list(baseline=validation_a[held_moves,,drop=FALSE])
+  validation_predictions$no_change <- as.matrix(data[validation_move_rows,paste0('past_',targets)])
+  colnames(validation_predictions$no_change) <- targets
+  for (variant in c('adjustment','raw_destination','no_destination')) {
     chosen_models <- list()
+    variant_predictions <- matrix(NA_real_,length(held_moves),4L,dimnames=list(NULL,targets))
     for (target in targets) {
       best <- NULL
       residual <- data[[paste0('next_',target)]][residual_rows]-crossfit$predictions[residual_rows,target]
@@ -140,7 +144,8 @@ fit_player_translation <- function(bundle) {
         for (j in seq_along(config$lambda_grid)) for (scale in config$adjustment_scales) {
           prediction <- translation_clip(validation_a[held_moves,target] + scale*adjustments[,j], target)
           error <- mean(abs(prediction-data[[paste0('next_',target)]][validation_move_rows]))
-          trial <- list(lambda=config$lambda_grid[j], trade_weight=trade_weight, scale=scale, error=error)
+          trial <- list(lambda=config$lambda_grid[j], trade_weight=trade_weight, scale=scale,
+                        error=error,prediction=prediction)
           if (is.null(best) || error < best$error-1e-10) best <- trial
         }
       }
@@ -150,15 +155,20 @@ fit_player_translation <- function(bundle) {
           ifelse(data$verified_trade[all_residual_rows],best$trade_weight,1))
       chosen$adjustment_scale <- best$scale; chosen$trade_weight <- best$trade_weight
       chosen_models[[target]] <- chosen
+      variant_predictions[,target] <- best$prediction
       tuning[[length(tuning)+1L]] <- data.frame(stage=variant, target=target, lambda=best$lambda,
-          trade_weight=best$trade_weight, scale=best$scale, validation_mae=best$error)
+          trade_weight=best$trade_weight, scale=best$scale, validation_mae=best$error,cohort='verified_trades')
     }
-    if (variant=='adjustment') models_b <- chosen_models else models_no_destination <- chosen_models
+    validation_predictions[[variant]] <- variant_predictions
+    if (variant=='adjustment') models_b <- chosen_models else if (variant=='raw_destination')
+      models_raw <- chosen_models else models_no_destination <- chosen_models
   }
   for (target in targets) models_a[[target]] <- fit_translation_ridge(data[development,], features$baseline,
       data[[paste0('next_',target)]][development], lambda_a[[target]])
-  list(version='phase-1', config=config, targets=targets, baseline=models_a,
-       adjustment=models_b, no_destination=models_no_destination,
+  list(version='phase-2', config=config, targets=targets, baseline=models_a,
+       adjustment=models_b, no_destination=models_no_destination,raw_destination=models_raw,
+       validation_predictions=validation_predictions,validation_trade_ids=data$record_id[validation_move_rows],
+       validation_actual=as.matrix(data[validation_move_rows,paste0('next_',targets)]),
        tuning=do.call(rbind,tuning), crossfit_audit=crossfit$audit,
        split_rows=list(train=train, validation=validation, development=development, test=test),
        residual_rows=all_residual_rows, tuning_residual_rows=residual_rows,
@@ -174,7 +184,7 @@ fit_player_translation <- function(bundle) {
 # outcomes, player IDs or future game rows. Model B is exactly zero for stayers.
 predict_player_translation <- function(model, newdata) {
   n <- nrow(newdata); targets <- model$targets
-  baseline <- final <- no_destination <- matrix(NA_real_, n, length(targets), dimnames=list(NULL,targets))
+  baseline <- final <- no_destination <- raw_destination <- matrix(NA_real_, n, length(targets), dimnames=list(NULL,targets))
   moved <- as.logical(newdata$transfer)
   if (length(moved)!=n || anyNA(moved)) stop('Supply transfer=TRUE/FALSE for each row.')
   if ('cutoff' %in% names(newdata) && any(as.Date(newdata$cutoff) <= model$latest_training_label))
@@ -183,8 +193,11 @@ predict_player_translation <- function(model, newdata) {
     baseline[,target] <- translation_clip(predict_translation_ridge(model$baseline[[target]], newdata)[,1L], target)
     b <- predict_translation_ridge(model$adjustment[[target]], newdata)[,1L]*model$adjustment[[target]]$adjustment_scale
     b0 <- predict_translation_ridge(model$no_destination[[target]], newdata)[,1L]*model$no_destination[[target]]$adjustment_scale
+    raw <- if (!is.null(model$raw_destination))
+      predict_translation_ridge(model$raw_destination[[target]],newdata)[,1L]*model$raw_destination[[target]]$adjustment_scale else rep(0,n)
     final[,target] <- translation_clip(baseline[,target] + ifelse(moved,b,0), target)
     no_destination[,target] <- translation_clip(baseline[,target] + ifelse(moved,b0,0), target)
+    raw_destination[,target] <- translation_clip(baseline[,target] + ifelse(moved,raw,0),target)
   }
-  list(baseline=baseline, final=final, no_destination=no_destination)
+  list(baseline=baseline, final=final, no_destination=no_destination,raw_destination=raw_destination)
 }
